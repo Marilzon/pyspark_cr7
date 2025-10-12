@@ -1,6 +1,12 @@
 import subprocess
 import sys
 
-args = f"pyspark_cr7/{sys.argv[1]}.py"
+arg = sys.argv[1]
 
-subprocess.Popen(["uv", "run", args])
+modules = {"scd2": "pyspark_cr7/scd2/main.py"}
+
+if arg in modules:
+    subprocess.Popen(["uv", "run", modules[arg]])
+else:
+    print(f"Module {arg} not found!")
+    print(f"Available modules: {(modules.keys())}")
