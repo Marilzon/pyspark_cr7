@@ -1,11 +1,7 @@
 import logging
 from pyspark.sql.session import SparkSession, DataFrame
-from pyspark.sql.functions import (
-    lit,
-    max as spark_max,
-    when,
-    col,
-)
+from pyspark.sql.types import DateType
+from pyspark.sql.functions import lit, max as spark_max, when, col, coalesce
 from delta import *
 
 builder = (
@@ -19,6 +15,7 @@ builder = (
 
 spark = configure_spark_with_delta_pip(builder).getOrCreate()
 
+
 # logging
 logging.basicConfig(
     level=logging.INFO,
@@ -28,6 +25,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logger.info("Spark session created successfully with Delta Lake configuration")
 
+
 # add metadata function
 def add_scd2_metadata(dataframe: DataFrame):
     logger.info(
@@ -35,163 +33,135 @@ def add_scd2_metadata(dataframe: DataFrame):
     )
     return (
         dataframe.withColumn("is_active", lit(1))
-        .withColumn("start_date", dataframe["created_date"])
-        .withColumn("end_date", lit("9999-12-31"))
-        .withColumn("version", lit(1))  
+        .withColumn("start_date", coalesce(dataframe["created_date"]))
+        .withColumn("end_date", lit(""))
+        .withColumn("version", lit(1))
     )
+
+
+def new_data_classifier(current_data: DataFrame, new_data: DataFrame):
+    current_data.createOrReplaceTempView("current_data")
+    new_data.createOrReplaceTempView("new_data")
+
+    changes_query = """
+    SELECT *
+    FROM new_data
+    EXCEPT
+    SELECT * EXCEPT(start_date, end_date, version, is_active)
+    FROM current_data
+    """
+
+    return spark.sql(changes_query)
+
+
+def expire_old_register(target_table: str, data_to_update_df: DataFrame, ids: list):
+    data_to_update_df.createOrReplaceTempView("data_to_expire")
+    join_conditions = " AND ".join([f"target.{id} = source.{id}" for id in ids])
+
+    return spark.sql(
+        f"""
+        MERGE INTO {target_table} AS target
+        USING data_to_expire AS source
+        ON {join_conditions} AND target.is_active = 1
+        WHEN MATCHED THEN UPDATE SET
+            target.is_active = 0,
+            target.end_date = CURRENT_DATE()
+    """
+    )
+
 
 # animals data csv
 logger.info("Reading animals data from CSV file: pyspark_cr7/scd2/data/animals.csv")
-animals_df = (
+current_data_df = (
     spark.read.format("csv")
     .option("header", "true")
     .load("pyspark_cr7/scd2/data/animals.csv")
 )
 
-logger.info("animals csv dataframe:")
-logger.info(f"Animals CSV dataframe loaded with {animals_df.count()} rows")
+logger.info(f"dataframe loaded with {current_data_df.count()} rows")
 
 # add metadata
-animals_df = add_scd2_metadata(animals_df)
+current_data_df = add_scd2_metadata(current_data_df)
 logger.info("SCD2 metadata added successfully")
 
+
 # write animals table
-animals_df.write.format("delta").mode("overwrite").saveAsTable("scd_type2_animals")
+current_data_df.write.format("delta").mode("overwrite").saveAsTable("scd_type2_animals")
 logger.info("Animals table successfully written to Delta format")
+
 
 # read animals table
 logger.info("Reading animals data from Delta table: scd_type2_animals")
-scd_type2_animals_df = spark.read.table("scd_type2_animals")
-scd_type2_animals_df.show()
+current_data_df = spark.read.table("scd_type2_animals")
+current_data_df.show()
+current_data_df.printSchema()
 
-# updated animals data csv
+
+# new animals data csv
 logger.info(
     "Reading updated animals data from CSV file: pyspark_cr7/scd2/data/updated_animals.csv"
 )
-updated_animals_df = (
+new_data_df = (
     spark.read.format("csv")
     .option("header", "true")
     .load("pyspark_cr7/scd2/data/updated_animals.csv")
 )
 
-updated_animals_df.show()
+new_data_df.show()
+new_data_df.printSchema()
 
-# Create temporary views
-updated_animals_df.createOrReplaceTempView("updated_animals")
-scd_type2_animals_df.createOrReplaceTempView("animals")
 
-# Detectar mudanças CORRETAMENTE
-logger.info("Detecting changes between original and updated data")
+# Classify new data and expire old register
+logger.info("Classify new data and expire old register")
 
-changes_query = """
-    SELECT 
-        ua.id,
-        ua.animal as new_animal,
-        ua.created_date as new_created_date,
-        a.animal as old_animal,
-        a.created_date as old_created_date,
-        a.version as old_version
-    FROM updated_animals ua
-    LEFT JOIN animals a ON ua.id = a.id AND a.is_active = 1
-    WHERE a.id IS NULL  
-       OR ua.animal != a.animal 
-       OR ua.created_date != a.created_date 
-"""
-
-changes_df = spark.sql(changes_query)
-changes_df.show()
-
-# Separar em registros para expirar e novos registros
-records_to_expire = changes_df.filter(col("old_animal").isNotNull()).select(
-    col("id").alias("expire_id")
+data_to_update_df = new_data_classifier(
+    current_data=current_data_df, new_data=new_data_df
 )
 
-new_and_changed_records = changes_df.select(
-    col("id"),
-    col("new_animal").alias("animal"),
-    col("new_created_date").alias("created_date")
-)
+data_to_update_df.show()
 
-records_to_expire.show()
-new_and_changed_records.show()
+expire_old_register("scd_type2_animals", data_to_update_df, ["id"])
 
-# Expire old records
-logger.info("Expiring old records")
-if records_to_expire.count() > 0:
-    records_to_expire.createOrReplaceTempView("records_to_expire")
-    
-    expire_result = spark.sql("""
-        MERGE INTO scd_type2_animals AS target
-        USING records_to_expire AS source
-        ON target.id = source.expire_id AND target.is_active = 1
-        WHEN MATCHED THEN UPDATE SET
-            target.is_active = 0,
-            target.end_date = current_date()
-    """)
-    
-    logger.info(f"MERGE completed: {expire_result}")
-else:
-    logger.info("No records to expire")
+# Append new regieters with metadata
 
-# Verificar registros expirados
-logger.info("Checking expired records:")
-spark.sql("SELECT * FROM scd_type2_animals WHERE is_active = 0").show()
 
-# RELER a tabela após o MERGE para obter as versões atualizadas
-scd_type2_animals_df = spark.read.table("scd_type2_animals")
-scd_type2_animals_df.createOrReplaceTempView("animals")
+def append_new_scd2_data(updated_dataframe: DataFrame, table_name: str, ids: list):
 
-# Obter as últimas versões da tabela ATUALIZADA
-latest_versions = scd_type2_animals_df.filter(col("is_active").isin([0, 1])) \
-    .groupBy("id") \
-    .agg(spark_max("version").alias("latest_version"))
-
-latest_versions.show()
-
-# Preparar novos registros
-logger.info("Preparing new and changed records")
-
-append_records = (
-    new_and_changed_records.alias("ncr")
-    .join(latest_versions.alias("lv"), col("ncr.id") == col("lv.id"), "left")
-    .withColumn(
-        "version",
-        when(col("lv.latest_version").isNull(), lit(1))  
-        .otherwise(col("lv.latest_version") + 1)
+    latest_data_df = spark.read.table(table_name)
+    latest_data_df = current_data_df.groupBy(ids).agg(
+        spark_max("version").alias("latest_version")
     )
-    .withColumn("start_date", col("ncr.created_date"))
-    .withColumn("end_date", lit("9999-12-31"))
-    .withColumn("is_active", lit(1))
-    .select(
-        "ncr.id", "ncr.animal", "ncr.created_date", 
-        "start_date", "end_date", "version", "is_active"
+
+    join_condition = [id for id in ids]
+
+    to_append_records_df = updated_dataframe.join(
+        latest_data_df, join_condition, "left"
     )
+
+    to_append_records_df = (
+        to_append_records_df.withColumn(
+            "version",
+            when(col("latest_version").isNull(), lit(1)).otherwise(
+                col("latest_version") + 1
+            ),
+        )
+        .withColumn("start_date", (col("created_date")))
+        .withColumn("end_date", lit(""))
+        .withColumn("is_active", lit(1))
+        .drop("latest_version")
+    )
+
+    return (
+        to_append_records_df.write.format("delta")
+        .mode("append")
+        .saveAsTable(table_name)
+    )
+
+
+append_new_scd2_data(
+    updated_dataframe=data_to_update_df, table_name="scd_type2_animals", ids=["id"]
 )
 
-append_records.show()
 
-# Inserir novos registros
-logger.info("Inserting new and changed records")
-if append_records.count() > 0:
-    append_records.write.format("delta").mode("append").saveAsTable("scd_type2_animals")
-    logger.info("New records inserted successfully")
-else:
-    logger.info("No new records to insert")
-
-# Resultado final
-logger.info("Final result - all records:")
-final_result = spark.sql("""
-    SELECT * FROM scd_type2_animals 
-    ORDER BY id, version DESC
-""")
-final_result.show()
-
-logger.info("Final result - active records only:")
-active_result = spark.sql("""
-    SELECT * FROM scd_type2_animals 
-    WHERE is_active = 1
-    ORDER BY id
-""")
-active_result.show()
-
+spark.read.table("scd_type2_animals").show()
 spark.stop()
