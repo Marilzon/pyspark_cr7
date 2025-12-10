@@ -1,9 +1,15 @@
-import subprocess
+import glob
 import sys
+import subprocess
+
+modules_key = [value.split("/")[-1] for value in glob.glob("pyspark_cr7/*")]
+modules_path = glob.glob("pyspark_cr7/**/main.py")
+
+modules = dict(zip(modules_key, modules_path))
+
+print(modules)
 
 arg = sys.argv[1]
-
-modules = {"scd2": "pyspark_cr7/scd2/main.py", "scd1": "pyspark_cr7/scd1/main.py"}
 
 if arg in modules:
     subprocess.Popen(["uv", "run", modules[arg]])
