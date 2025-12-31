@@ -154,8 +154,6 @@ checkpoints/
 *.json
 *.avro
 *.orc
-data/
-datasets/
 
 # Large model files
 *.model
